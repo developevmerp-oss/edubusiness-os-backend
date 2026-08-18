@@ -156,7 +156,7 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction) =>
         res.cookie(AUTH_COOKIE_NAME, token, {
             httpOnly: true,
             secure: env.NODE_ENV === 'production',
-            sameSite: 'lax',
+            sameSite: env.NODE_ENV === 'production' ? 'none' : 'lax',
             path: '/',
             maxAge: 24 * 60 * 60 * 1000 // 24 hours
         });
@@ -288,4 +288,5 @@ router.post('/parents-students', authenticate, requireRole(['admin']), async (re
 });
 
 export default router;
+
 
