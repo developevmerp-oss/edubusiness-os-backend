@@ -1,7 +1,11 @@
-import { Request, Response, NextFunction } from 'express';
+﻿import { Request, Response, NextFunction } from 'express';
 import { db } from '../config/db';
 
 export async function tenantResolver(req: Request, res: Response, next: NextFunction) {
+    // Allow registration without tenant context
+    if (req.path === '/api/auth/register-tenant' || req.originalUrl.indexOf('/register-tenant') -ne -1) {
+        return next();
+    }
     try {
         // 1. Resolve subdomain from headers (for easy testing/frontend BFF routing) or hostname
         let subdomain = req.headers['x-tenant-subdomain'] as string;
@@ -49,3 +53,4 @@ export async function tenantResolver(req: Request, res: Response, next: NextFunc
         next(error);
     }
 }
+
