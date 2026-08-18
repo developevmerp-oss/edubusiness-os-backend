@@ -3,7 +3,7 @@ import { db } from '../config/db';
 
 export async function tenantResolver(req: Request, res: Response, next: NextFunction) {
     // Allow registration without tenant context
-    if (req.path === '/api/auth/register-tenant' || req.originalUrl.indexOf('/register-tenant') -ne -1) {
+    if (req.path === '/api/auth/register-tenant' || req.originalUrl.indexOf('/register-tenant') !== -1) {
         return next();
     }
     try {
@@ -53,4 +53,5 @@ export async function tenantResolver(req: Request, res: Response, next: NextFunc
         next(error);
     }
 }
+
 
