@@ -1,4 +1,4 @@
-import { Router, Request, Response, NextFunction } from 'express';
+﻿import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { db } from '../config/db';
 import { authenticate } from '../middlewares/auth';
@@ -250,7 +250,7 @@ router.post('/checkout/:orderId/verify', authenticate, async (req: Request, res:
         }
 
         // 5. Generate Invoice details
-        const invoiceNumber = `INV-${Date.now()}-${orderId.slice(0, 4).toUpperCase()}`;
+        const invoiceNumber = `INV-${Date.now()}-${(Array.isArray(orderId) ? orderId[0] : orderId).slice(0, 4).toUpperCase()}`;
         await client.query(
             `INSERT INTO invoices (order_id, invoice_number, issued_at)
              VALUES ($1, $2, CURRENT_TIMESTAMP)`,
@@ -297,3 +297,4 @@ router.get('/invoices', authenticate, async (req: Request, res: Response, next: 
 });
 
 export default router;
+
