@@ -3,9 +3,7 @@ import { db } from '../config/db';
 
 export async function tenantResolver(req: Request, res: Response, next: NextFunction) {
     // Allow registration without tenant context
-    if (req.path === '/api/auth/register-tenant' || req.originalUrl.indexOf('/register-tenant') !== -1) {
-        return next();
-    }
+    if (req.path === '/api/auth/register-tenant' || req.originalUrl.indexOf('/register-tenant') !== -1 || req.path === '/api/auth/login' || req.originalUrl.indexOf('/login') !== -1) { return next(); }
     try {
         // 1. Resolve subdomain from headers (for easy testing/frontend BFF routing) or hostname
         let subdomain = req.headers['x-tenant-subdomain'] as string;
@@ -53,5 +51,6 @@ export async function tenantResolver(req: Request, res: Response, next: NextFunc
         next(error);
     }
 }
+
 
 

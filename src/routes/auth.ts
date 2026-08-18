@@ -1,4 +1,4 @@
-import { Router, Request, Response, NextFunction } from 'express';
+﻿import { Router, Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
@@ -92,23 +92,35 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction) =>
         const { email, password } = loginSchema.parse(req.body);
         const tenant = req.tenant;
 
-        if (!tenant) {
-            res.status(400).json({ error: 'Tenant context is missing.' });
-            return;
+        let userResult;
+        
+        // If subdomain is 'abc' (default fallback) or not present, do a global search by email
+        if (!tenant || tenant.subdomain === 'abc') {
+            userResult = await db.query(
+                `SELECT u.id, u.email, u.password_hash, u.first_name, u.last_name, u.role, u.status, u.tenant_id,
+                        t.name as tenant_name, t.subdomain as tenant_subdomain, t.branding as tenant_branding
+                 FROM users u
+                 JOIN tenants t ON u.tenant_id = t.id
+                 WHERE u.email = $1`,
+                [email]
+            );
+        } else {
+            userResult = await db.query(
+                `SELECT u.id, u.email, u.password_hash, u.first_name, u.last_name, u.role, u.status, u.tenant_id,
+                        t.name as tenant_name, t.subdomain as tenant_subdomain, t.branding as tenant_branding
+                 FROM users u
+                 JOIN tenants t ON u.tenant_id = t.id
+                 WHERE u.tenant_id = $1 AND u.email = $2`,
+                [tenant.id, email]
+            );
         }
 
-        // Retrieve user under the current tenant context
-        const result = await db.query(
-            'SELECT id, email, password_hash, first_name, last_name, role, status FROM users WHERE tenant_id = $1 AND email = $2',
-            [tenant.id, email]
-        );
-
-        if (result.rows.length === 0) {
+        if (userResult.rows.length === 0) {
             res.status(401).json({ error: 'Invalid email or password.' });
             return;
         }
 
-        const user = result.rows[0];
+        const user = userResult.rows[0];
 
         if (user.status !== 'active') {
             res.status(403).json({ error: 'Your account has been deactivated.' });
@@ -121,10 +133,17 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction) =>
             return;
         }
 
+        const resolvedTenant = {
+            id: user.tenant_id,
+            name: user.tenant_name,
+            subdomain: user.tenant_subdomain,
+            branding: typeof user.tenant_branding === 'string' ? JSON.parse(user.tenant_branding) : user.tenant_branding
+        };
+
         // Generate JWT token
         const payload = {
             id: user.id,
-            tenant_id: tenant.id,
+            tenant_id: resolvedTenant.id,
             email: user.email,
             role: user.role,
             first_name: user.first_name,
@@ -151,7 +170,7 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction) =>
                 last_name: user.last_name,
                 role: user.role
             },
-            tenant
+            tenant: resolvedTenant
         });
     } catch (error) {
         next(error);
@@ -269,3 +288,4 @@ router.post('/parents-students', authenticate, requireRole(['admin']), async (re
 });
 
 export default router;
+
