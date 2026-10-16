@@ -372,5 +372,171 @@ router.get('/invoices', authenticate, async (req: Request, res: Response, next: 
     }
 });
 
+/**
+ * ========================================================
+ * PHASE 4: COURSE BUNDLES & DIGITAL DOWNLOAD PRODUCTS
+ * ========================================================
+ */
+
+/**
+ * 6. Get Available Course Bundles
+ */
+router.get('/bundles', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const tenantId = req.tenant!.id;
+        const result = await db.query(
+            `SELECT * FROM course_bundles 
+             WHERE tenant_id = $1 AND is_published = TRUE 
+             ORDER BY created_at DESC`,
+            [tenantId]
+        );
+
+        res.json({ bundles: result.rows });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 7. Purchase Course Bundle (1-Click Super Pack Enrollment)
+ */
+router.post('/bundles/:id/buy', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+    const client = await db.getClient();
+    try {
+        const { id } = req.params;
+        const tenantId = req.tenant!.id;
+        const userId = req.user!.id;
+
+        const bundleRes = await client.query(
+            'SELECT * FROM course_bundles WHERE id = $1 AND tenant_id = $2',
+            [id, tenantId]
+        );
+
+        if (bundleRes.rows.length === 0) {
+            res.status(404).json({ error: 'Course bundle not found.' });
+            return;
+        }
+
+        const bundle = bundleRes.rows[0];
+        const courses = typeof bundle.courses_included === 'string' 
+            ? JSON.parse(bundle.courses_included) 
+            : bundle.courses_included;
+
+        await client.query('BEGIN');
+
+        // Enroll in all courses included
+        for (const item of courses) {
+            if (item.id) {
+                await client.query(
+                    `INSERT INTO course_enrollments (course_id, student_id)
+                     VALUES ($1, $2)
+                     ON CONFLICT DO NOTHING`,
+                    [item.id, userId]
+                );
+            }
+        }
+
+        // Create Order and Invoice
+        const orderRes = await client.query(
+            `INSERT INTO orders (tenant_id, user_id, item_type, item_id, amount, discount_amount, final_amount, status, payment_gateway, gateway_payment_id)
+             VALUES ($1, $2, 'bundle', $3, $4, 0, $4, 'paid', 'sandbox', $5)
+             RETURNING id`,
+            [tenantId, userId, id, bundle.bundle_price, `bundle-${Date.now()}`]
+        );
+
+        const orderId = orderRes.rows[0].id;
+        const invoiceNumber = `INV-BNDL-${Date.now().toString().slice(-6)}`;
+        await client.query(
+            `INSERT INTO invoices (order_id, invoice_number, issued_at)
+             VALUES ($1, $2, CURRENT_TIMESTAMP)`,
+            [orderId, invoiceNumber]
+        );
+
+        await client.query('COMMIT');
+
+        res.json({
+            message: `Super Pack Unlocked! You have been successfully enrolled in all ${courses.length} courses included in the bundle.`,
+            bundleTitle: bundle.title,
+            coursesEnrolled: courses.length,
+            invoiceNumber
+        });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        next(error);
+    } finally {
+        client.release();
+    }
+});
+
+/**
+ * 8. Get Digital Products (Notes, Formula Sheets, Test Series)
+ */
+router.get('/digital-products', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const tenantId = req.tenant!.id;
+        const userId = req.user!.id;
+
+        const result = await db.query(
+            `SELECT dp.*,
+                    CASE WHEN dpp.id IS NOT NULL THEN TRUE ELSE FALSE END as is_purchased
+             FROM digital_products dp
+             LEFT JOIN digital_product_purchases dpp ON dp.id = dpp.product_id AND dpp.user_id = $1
+             WHERE dp.tenant_id = $2 AND dp.is_published = TRUE
+             ORDER BY dp.downloads_count DESC, dp.created_at DESC`,
+            [userId, tenantId]
+        );
+
+        res.json({ products: result.rows });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 9. Purchase Digital Product (1-Click Instant Unlock)
+ */
+router.post('/digital-products/:id/buy', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const { id } = req.params;
+        const tenantId = req.tenant!.id;
+        const userId = req.user!.id;
+
+        const prodRes = await db.query(
+            'SELECT * FROM digital_products WHERE id = $1 AND tenant_id = $2',
+            [id, tenantId]
+        );
+
+        if (prodRes.rows.length === 0) {
+            res.status(404).json({ error: 'Digital product not found.' });
+            return;
+        }
+
+        const product = prodRes.rows[0];
+
+        // Unlock purchase
+        await db.query(
+            `INSERT INTO digital_product_purchases (tenant_id, user_id, product_id)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (user_id, product_id) DO NOTHING`,
+            [tenantId, userId, id]
+        );
+
+        // Increment download counter
+        await db.query(
+            'UPDATE digital_products SET downloads_count = downloads_count + 1 WHERE id = $1',
+            [id]
+        );
+
+        res.json({
+            message: `Purchase successful! "${product.title}" is now unlocked for instant DRM download.`,
+            downloadUrl: product.file_url,
+            isPurchased: true
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
 export default router;
+
 
