@@ -146,4 +146,104 @@ router.get('/payments', authenticate, requireRole(['admin']), async (req: Reques
     }
 });
 
+/**
+ * 4. Get Fee Installment Schedules
+ */
+router.get('/installments', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const tenantId = req.tenant!.id;
+        const user = req.user!;
+
+        let query = `
+            SELECT fi.*, u.first_name as student_first_name, u.last_name as student_last_name, u.email as student_email,
+                   c.title as course_title
+            FROM fee_installments fi
+            JOIN users u ON fi.student_id = u.id
+            LEFT JOIN courses c ON fi.course_id = c.id
+            WHERE fi.tenant_id = $1
+        `;
+        const params: any[] = [tenantId];
+
+        if (user.role === 'student') {
+            query += ' AND fi.student_id = $2';
+            params.push(user.id);
+        } else if (user.role === 'parent') {
+            query += ` AND fi.student_id IN (
+                SELECT student_id FROM parents_students WHERE parent_id = $2
+            )`;
+            params.push(user.id);
+        }
+
+        query += ' ORDER BY fi.due_date ASC, fi.installment_number ASC';
+
+        const result = await db.query(query, params);
+        res.json({ installments: result.rows });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 5. Pay an Installment (Student or Admin)
+ */
+router.post('/installments/:id/pay', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const tenantId = req.tenant!.id;
+        const { id } = req.params;
+
+        const updateRes = await db.query(`
+            UPDATE fee_installments
+            SET status = 'paid',
+                paid_at = CURRENT_TIMESTAMP
+            WHERE id = $1 AND tenant_id = $2
+            RETURNING *
+        `, [id, tenantId]);
+
+        if (updateRes.rows.length === 0) {
+            res.status(404).json({ error: 'Installment record not found.' });
+            return;
+        }
+
+        res.json({
+            message: 'Installment fee payment recorded successfully.',
+            installment: updateRes.rows[0]
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 6. Create Multi-Installment Plan for a Student (Admin only)
+ */
+router.post('/installments/create', authenticate, requireRole(['admin']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const tenantId = req.tenant!.id;
+        const { studentId, courseId, installments } = req.body;
+
+        if (!Array.isArray(installments) || installments.length === 0) {
+            res.status(400).json({ error: 'Installments list must be provided.' });
+            return;
+        }
+
+        const inserted: any[] = [];
+        for (let i = 0; i < installments.length; i++) {
+            const inst = installments[i];
+            const insRes = await db.query(`
+                INSERT INTO fee_installments (tenant_id, student_id, course_id, installment_number, amount, due_date, status)
+                VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+                RETURNING *
+            `, [tenantId, studentId, courseId || null, i + 1, inst.amount, inst.dueDate]);
+            inserted.push(insRes.rows[0]);
+        }
+
+        res.status(201).json({
+            message: `${inserted.length} fee installments schedule created successfully.`,
+            installments: inserted
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
 export default router;

@@ -25,6 +25,8 @@ import aiRouter from './routes/ai';
 import settingsRouter from './routes/settings';
 import certificatesRouter from './routes/certificates';
 import consultationsRouter from './routes/consultations';
+import doubtsRouter from './routes/doubts';
+import assignmentsRouter from './routes/assignments';
 
 const app = express();
 
@@ -102,6 +104,8 @@ app.use('/api/ai', aiRouter);
 app.use('/api/settings', settingsRouter);
 app.use('/api/certificates', certificatesRouter);
 app.use('/api/consultations', consultationsRouter);
+app.use('/api/doubts', doubtsRouter);
+app.use('/api/assignments', assignmentsRouter);
 
 // 6. Handle 404 Route Fallbacks
 app.use((req, res) => {
