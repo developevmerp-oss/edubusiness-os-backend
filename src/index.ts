@@ -1,4 +1,4 @@
-﻿import express from 'express';
+import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import { env } from './config/env';
@@ -33,17 +33,30 @@ app.use(cors({
     origin: (origin, callback) => {
         // Allow requests with no origin (like mobile apps, curl, or local testing tools)
         if (!origin) return callback(null, true);
-        
+
+        const isLocalhost = 
+            origin === 'http://localhost:3000' ||
+            origin === 'http://127.0.0.1:3000' ||
+            origin.startsWith('http://localhost:') ||
+            origin.startsWith('http://127.0.0.1:') ||
+            origin.endsWith('.localhost:3000') ||
+            origin.endsWith('.localhost:5000');
+
+        const isVercel = 
+            origin.endsWith('.vercel.app') || 
+            origin === 'https://vercel.app';
+
         // Match frontend domains, wildcard subdomains for tenant routing, or local dev url
-        const isAllowed = origin === env.FRONTEND_URL || 
-                          origin.endsWith('.localhost:3000') ||
-                          origin.endsWith('.vercel.app') ||
-                          env.NODE_ENV === 'development';
-                          
+        const isAllowed = 
+            isLocalhost ||
+            isVercel ||
+            origin === env.FRONTEND_URL ||
+            env.NODE_ENV === 'development';
+
         if (isAllowed) {
             callback(null, true);
         } else {
-            callback(new Error('Not allowed by CORS'));
+            callback(null, false);
         }
     },
     credentials: true,
@@ -98,12 +111,12 @@ app.use((req, res) => {
 // 7. Centralized Error Handler (SQL masking, Zod parsing formatting)
 app.use(errorHandler);
 
-// 8. Bind Server Listener - RESTRICTED to 127.0.0.1 for testing security
+// 8. Bind Server Listener
 const PORT = env.PORT;
-const HOST = process.env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1';
+const HOST = process.env.PORT || process.env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1';
 
 app.listen(PORT, HOST, () => {
-    console.log(`ðŸš€ EduBusiness OS Backend running at http://${HOST}:${PORT}`);
-    console.log(`ðŸ”§ Mode: ${env.NODE_ENV}`);
+    console.log(`🚀 EduBusiness OS Backend running at http://${HOST}:${PORT}`);
+    console.log(`🔧 Mode: ${env.NODE_ENV}`);
 });
 

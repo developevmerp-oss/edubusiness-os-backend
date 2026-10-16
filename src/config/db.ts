@@ -1,17 +1,16 @@
-﻿import { Pool } from 'pg';
+import { Pool } from 'pg';
 import { env } from './env';
 
 const pool = new Pool({
     connectionString: env.DATABASE_URL,
-    ssl: env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    ssl: { rejectUnauthorized: false },
     max: 20,
     idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 2000,
+    connectionTimeoutMillis: 10000,
 });
 
 pool.on('error', (err) => {
-    console.error('Unexpected error on idle client', err);
-    process.exit(-1);
+    console.error('Idle database client error (pool will recover):', err.message);
 });
 
 export const db = {

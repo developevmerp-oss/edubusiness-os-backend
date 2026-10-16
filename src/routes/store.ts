@@ -1,4 +1,4 @@
-﻿import { Router, Request, Response, NextFunction } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { db } from '../config/db';
 import { authenticate } from '../middlewares/auth';
@@ -12,7 +12,8 @@ const couponValidateSchema = z.object({
 const checkoutSchema = z.object({
     courseId: z.string().uuid(),
     couponCode: z.string().toUpperCase().optional(),
-    gateway: z.enum(['stripe', 'razorpay', 'sandbox']).default('sandbox')
+    gateway: z.enum(['stripe', 'razorpay', 'sandbox']).default('sandbox'),
+    orderBump: z.boolean().optional().default(false)
 });
 
 /**
@@ -97,7 +98,7 @@ router.post('/coupons/validate', authenticate, async (req: Request, res: Respons
  */
 router.post('/checkout', authenticate, async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const { courseId, couponCode, gateway } = checkoutSchema.parse(req.body);
+        const { courseId, couponCode, gateway, orderBump } = checkoutSchema.parse(req.body);
         const tenantId = req.tenant!.id;
         const userId = req.user!.id;
 
@@ -113,7 +114,9 @@ router.post('/checkout', authenticate, async (req: Request, res: Response, next:
         }
 
         const course = courseRes.rows[0];
-        const baseAmount = parseFloat(course.price);
+        const coursePrice = parseFloat(course.price);
+        const bumpAmount = orderBump ? 199.00 : 0.00;
+        const baseAmount = coursePrice + bumpAmount;
 
         // Verify student doesn't already own the course
         const ownershipCheck = await db.query(
