@@ -13,7 +13,8 @@ const checkoutSchema = z.object({
     courseId: z.string().uuid(),
     couponCode: z.string().toUpperCase().optional(),
     gateway: z.enum(['stripe', 'razorpay', 'sandbox']).default('sandbox'),
-    orderBump: z.boolean().optional().default(false)
+    orderBump: z.boolean().optional().default(false),
+    referralCode: z.string().toUpperCase().optional()
 });
 
 /**
@@ -64,6 +65,22 @@ router.post('/coupons/validate', authenticate, async (req: Request, res: Respons
     try {
         const { code } = couponValidateSchema.parse(req.body);
         const tenantId = req.tenant!.id;
+
+        // Built-in Dynamic Recovery Coupon
+        if (code === 'RECOVER15') {
+            res.json({
+                coupon: {
+                    id: 'coupon-recover15',
+                    code: 'RECOVER15',
+                    discount_type: 'percentage',
+                    discount_value: '15',
+                    max_uses: 10000,
+                    uses_count: 0,
+                    expiry_date: new Date(Date.now() + 30 * 24 * 3600 * 1000)
+                }
+            });
+            return;
+        }
 
         const couponCheck = await db.query(
             'SELECT id, code, discount_type, discount_value, max_uses, uses_count, expiry_date FROM coupons WHERE tenant_id = $1 AND code = $2',
@@ -134,21 +151,25 @@ router.post('/checkout', authenticate, async (req: Request, res: Response, next:
         let couponId: string | null = null;
 
         if (couponCode) {
-            const couponRes = await db.query(
-                'SELECT id, discount_type, discount_value, max_uses, uses_count, expiry_date FROM coupons WHERE tenant_id = $1 AND code = $2',
-                [tenantId, couponCode]
-            );
+            if (couponCode === 'RECOVER15') {
+                discountAmount = (baseAmount * 15) / 100;
+            } else {
+                const couponRes = await db.query(
+                    'SELECT id, discount_type, discount_value, max_uses, uses_count, expiry_date FROM coupons WHERE tenant_id = $1 AND code = $2',
+                    [tenantId, couponCode]
+                );
 
-            if (couponRes.rows.length > 0) {
-                const coupon = couponRes.rows[0];
-                const isValid = new Date() <= new Date(coupon.expiry_date) && coupon.uses_count < coupon.max_uses;
+                if (couponRes.rows.length > 0) {
+                    const coupon = couponRes.rows[0];
+                    const isValid = new Date() <= new Date(coupon.expiry_date) && coupon.uses_count < coupon.max_uses;
 
-                if (isValid) {
-                    couponId = coupon.id;
-                    if (coupon.discount_type === 'percentage') {
-                        discountAmount = (baseAmount * parseFloat(coupon.discount_value)) / 100;
-                    } else {
-                        discountAmount = Math.min(baseAmount, parseFloat(coupon.discount_value));
+                    if (isValid) {
+                        couponId = coupon.id;
+                        if (coupon.discount_type === 'percentage') {
+                            discountAmount = (baseAmount * parseFloat(coupon.discount_value)) / 100;
+                        } else {
+                            discountAmount = Math.min(baseAmount, parseFloat(coupon.discount_value));
+                        }
                     }
                 }
             }
@@ -259,6 +280,58 @@ router.post('/checkout/:orderId/verify', authenticate, async (req: Request, res:
              VALUES ($1, $2, CURRENT_TIMESTAMP)`,
             [orderId, invoiceNumber]
         );
+
+        // 6. Check for Referral Code & Attribute Affiliate Conversion
+        const { referralCode } = req.body || {};
+        if (referralCode) {
+            const affRes = await client.query(
+                'SELECT id, name, commission_rate FROM affiliates WHERE tenant_id = $1 AND referral_code = $2 AND status = \'active\'',
+                [tenantId, referralCode.toString().toUpperCase()]
+            );
+
+            if (affRes.rows.length > 0) {
+                const affiliate = affRes.rows[0];
+                const commRate = parseFloat(affiliate.commission_rate);
+                const orderAmount = parseFloat(order.final_amount);
+                const commissionEarned = (orderAmount * commRate) / 100;
+
+                // Fetch buyer name
+                const userRes = await client.query('SELECT first_name, last_name, email FROM users WHERE id = $1', [userId]);
+                const buyerName = userRes.rows[0] ? `${userRes.rows[0].first_name} ${userRes.rows[0].last_name}` : 'Student';
+                const buyerEmail = userRes.rows[0]?.email;
+
+                // Fetch course title
+                const courseTitleRes = await client.query('SELECT title FROM courses WHERE id = $1', [courseId]);
+                const courseTitle = courseTitleRes.rows[0]?.title || 'Course';
+
+                // Record conversion
+                await client.query(
+                    `INSERT INTO referral_conversions (tenant_id, affiliate_id, buyer_name, buyer_email, course_id, course_title, order_amount, commission_amount, status)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'approved')`,
+                    [tenantId, affiliate.id, buyerName, buyerEmail, courseId, courseTitle, orderAmount, commissionEarned]
+                );
+
+                // Update affiliate totals
+                await client.query(
+                    `UPDATE affiliates 
+                     SET total_earnings = total_earnings + $1, pending_payout = pending_payout + $1 
+                     WHERE id = $2`,
+                    [commissionEarned, affiliate.id]
+                );
+            }
+        }
+
+        // 7. Reconcile Abandoned Carts for this student and course
+        const studentRes = await client.query('SELECT email, phone FROM users WHERE id = $1', [userId]);
+        if (studentRes.rows.length > 0) {
+            const { email, phone } = studentRes.rows[0];
+            await client.query(
+                `UPDATE abandoned_carts 
+                 SET recovery_status = 'recovered' 
+                 WHERE tenant_id = $1 AND course_id = $2 AND (student_email = $3 OR student_phone = $4)`,
+                [tenantId, courseId, email, phone || '']
+            );
+        }
 
         await client.query('COMMIT');
         res.json({

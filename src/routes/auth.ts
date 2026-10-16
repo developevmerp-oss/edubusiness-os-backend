@@ -1,4 +1,4 @@
-﻿import { Router, Request, Response, NextFunction } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
@@ -287,6 +287,146 @@ router.post('/parents-students', authenticate, requireRole(['admin']), async (re
     }
 });
 
+/**
+ * 8. Send Instant Mobile OTP (Simulated / Gateway ready)
+ */
+router.post('/send-otp', async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const { phone } = z.object({
+            phone: z.string().min(10, 'Valid phone number required')
+        }).parse(req.body);
+
+        // Sanitize phone number: strip non-digit characters except +
+        const cleanedPhone = phone.trim().replace(/[^\d+]/g, '');
+
+        // Generate 6-digit random code
+        const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+        await db.query(
+            `INSERT INTO otp_verifications (phone, otp_code, expires_at)
+             VALUES ($1, $2, $3)`,
+            [cleanedPhone, otpCode, expiresAt]
+        );
+
+        res.json({
+            message: `OTP sent successfully to ${cleanedPhone}`,
+            demoOtp: otpCode, // For testing & demo verification
+            expiresInSeconds: 600
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 9. Verify Mobile OTP and Log In / Provision Student
+ */
+router.post('/verify-otp', async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const { phone, otp } = z.object({
+            phone: z.string().min(10),
+            otp: z.string().length(6, 'OTP must be 6 digits')
+        }).parse(req.body);
+
+        const cleanedPhone = phone.trim().replace(/[^\d+]/g, '');
+
+        // Validate OTP
+        const otpResult = await db.query(
+            `SELECT id FROM otp_verifications 
+             WHERE phone = $1 AND otp_code = $2 AND expires_at > NOW() AND verified = false
+             ORDER BY created_at DESC LIMIT 1`,
+            [cleanedPhone, otp]
+        );
+
+        if (otpResult.rows.length === 0) {
+            res.status(400).json({ error: 'Invalid or expired OTP. Please request a new code.' });
+            return;
+        }
+
+        // Mark OTP as verified
+        await db.query('UPDATE otp_verifications SET verified = true WHERE id = $1', [otpResult.rows[0].id]);
+
+        // Find or provision user
+        let userResult = await db.query(
+            `SELECT u.id, u.email, u.first_name, u.last_name, u.role, u.status, u.phone, u.tenant_id,
+                    t.name as tenant_name, t.subdomain as tenant_subdomain, t.branding as tenant_branding
+             FROM users u
+             JOIN tenants t ON u.tenant_id = t.id
+             WHERE u.phone = $1 OR u.email = $2 LIMIT 1`,
+            [cleanedPhone, `${cleanedPhone.replace('+', '')}@mobile.student`]
+        );
+
+        let user;
+        let tenantInfo;
+
+        if (userResult.rows.length > 0) {
+            user = userResult.rows[0];
+            tenantInfo = {
+                id: user.tenant_id,
+                name: user.tenant_name,
+                subdomain: user.tenant_subdomain,
+                branding: typeof user.tenant_branding === 'string' ? JSON.parse(user.tenant_branding) : user.tenant_branding
+            };
+        } else {
+            // Auto-provision student with default tenant
+            const tenantRes = await db.query('SELECT id, name, subdomain, branding FROM tenants LIMIT 1');
+            const tenant = tenantRes.rows[0];
+            tenantInfo = {
+                id: tenant.id,
+                name: tenant.name,
+                subdomain: tenant.subdomain,
+                branding: typeof tenant.branding === 'string' ? JSON.parse(tenant.branding) : tenant.branding
+            };
+
+            const randomPasswordHash = await bcrypt.hash(Math.random().toString(36), SALT_ROUNDS);
+            const newUserRes = await db.query(
+                `INSERT INTO users (tenant_id, email, password_hash, first_name, last_name, role, phone)
+                 VALUES ($1, $2, $3, $4, $5, 'student', $6)
+                 RETURNING id, email, first_name, last_name, role, phone`,
+                [tenant.id, `${cleanedPhone.replace('+', '')}@mobile.student`, randomPasswordHash, 'Student', cleanedPhone.slice(-4), cleanedPhone]
+            );
+            user = newUserRes.rows[0];
+        }
+
+        // Generate JWT
+        const payload = {
+            id: user.id,
+            tenant_id: tenantInfo.id,
+            email: user.email,
+            role: user.role,
+            first_name: user.first_name,
+            last_name: user.last_name
+        };
+
+        const token = jwt.sign(payload, env.JWT_SECRET, { expiresIn: '24h' });
+
+        res.cookie(AUTH_COOKIE_NAME, token, {
+            httpOnly: true,
+            secure: env.NODE_ENV === 'production',
+            sameSite: env.NODE_ENV === 'production' ? 'none' : 'lax',
+            path: '/',
+            maxAge: 24 * 60 * 60 * 1000
+        });
+
+        res.json({
+            message: 'OTP authentication successful',
+            user: {
+                id: user.id,
+                email: user.email,
+                first_name: user.first_name,
+                last_name: user.last_name,
+                role: user.role,
+                phone: user.phone
+            },
+            tenant: tenantInfo
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
 export default router;
+
 
 
