@@ -56,7 +56,7 @@ router.get('/:id', authenticate, async (req: Request, res: Response, next: NextF
         const tenantId = req.tenant!.id;
 
         const result = await db.query(
-            'SELECT id, title, description, duration_minutes, total_marks, negative_marks, is_published FROM exams WHERE id = $1 AND tenant_id = $2',
+            'SELECT id, title, description, duration_minutes, total_marks, negative_marks, is_published, COALESCE(is_fullscreen_enforced, true) as is_fullscreen_enforced, COALESCE(max_tab_switches, 3) as max_tab_switches FROM exams WHERE id = $1 AND tenant_id = $2',
             [id, tenantId]
         );
 
@@ -187,14 +187,19 @@ router.post('/:id/attempt', authenticate, requireRole(['student']), async (req: 
 
         // Check if student has an active ongoing attempt or has already submitted
         const attemptRes = await db.query(
-            'SELECT id, status, started_at FROM exam_attempts WHERE exam_id = $1 AND student_id = $2',
+            'SELECT id, status, started_at, COALESCE(tab_switch_count, 0) as tab_switch_count, submission_reason FROM exam_attempts WHERE exam_id = $1 AND student_id = $2',
             [id, studentId]
         );
 
         if (attemptRes.rows.length > 0) {
             const attempt = attemptRes.rows[0];
             if (attempt.status === 'ongoing') {
-                res.json({ message: 'Resuming ongoing attempt.', attemptId: attempt.id, startedAt: attempt.started_at });
+                res.json({ 
+                    message: 'Resuming ongoing attempt.', 
+                    attemptId: attempt.id, 
+                    startedAt: attempt.started_at,
+                    tabSwitchCount: attempt.tab_switch_count || 0
+                });
                 return;
             } else {
                 res.status(400).json({ error: 'You have already submitted this exam.' });
@@ -204,17 +209,150 @@ router.post('/:id/attempt', authenticate, requireRole(['student']), async (req: 
 
         // Create new attempt
         const result = await db.query(
-            'INSERT INTO exam_attempts (exam_id, student_id, started_at, status) VALUES ($1, $2, CURRENT_TIMESTAMP, \'ongoing\') RETURNING id, started_at',
+            'INSERT INTO exam_attempts (exam_id, student_id, started_at, status, tab_switch_count) VALUES ($1, $2, CURRENT_TIMESTAMP, \'ongoing\', 0) RETURNING id, started_at',
             [id, studentId]
         );
 
-        res.status(210).json({
+        res.status(201).json({
             message: 'Attempt initialized successfully.',
             attemptId: result.rows[0].id,
-            startedAt: result.rows[0].started_at
+            startedAt: result.rows[0].started_at,
+            tabSwitchCount: 0
         });
     } catch (error) {
         next(error);
+    }
+});
+
+/**
+ * 7. Record a proctoring violation (Tab switch, window blur, exit fullscreen)
+ */
+router.post('/attempts/:attemptId/violation', authenticate, requireRole(['student']), async (req: Request, res: Response, next: NextFunction) => {
+    const client = await db.getClient();
+    try {
+        const { attemptId } = req.params;
+        const studentId = req.user!.id;
+        const { reason, details } = z.object({
+            reason: z.string().default('tab_switch'),
+            details: z.string().optional()
+        }).parse(req.body);
+
+        await client.query('BEGIN');
+
+        // Verify attempt belongs to student and is ongoing
+        const attemptRes = await client.query(
+            `SELECT ea.id, ea.status, COALESCE(ea.tab_switch_count, 0) as tab_switch_count, ea.proctoring_flags,
+                    e.id as exam_id, COALESCE(e.max_tab_switches, 3) as max_tab_switches,
+                    e.negative_marks, e.total_marks
+             FROM exam_attempts ea
+             JOIN exams e ON ea.exam_id = e.id
+             WHERE ea.id = $1 AND ea.student_id = $2 FOR UPDATE`,
+            [attemptId, studentId]
+        );
+
+        if (attemptRes.rows.length === 0 || attemptRes.rows[0].status !== 'ongoing') {
+            await client.query('ROLLBACK');
+            res.status(400).json({ error: 'No active attempt session found.' });
+            return;
+        }
+
+        const attempt = attemptRes.rows[0];
+        const newSwitchCount = attempt.tab_switch_count + 1;
+        const maxSwitches = attempt.max_tab_switches || 3;
+
+        const currentFlags = Array.isArray(attempt.proctoring_flags) ? attempt.proctoring_flags : [];
+        const newFlags = [
+            ...currentFlags,
+            {
+                timestamp: new Date().toISOString(),
+                reason,
+                details: details || `Tab switch #${newSwitchCount}`,
+                strikeNumber: newSwitchCount
+            }
+        ];
+
+        const isTerminated = newSwitchCount >= maxSwitches;
+
+        if (isTerminated) {
+            // Auto-grade current answers and terminate the exam session
+            const questionsRes = await client.query(
+                'SELECT id, type, correct_answer FROM questions WHERE exam_id = $1',
+                [attempt.exam_id]
+            );
+            const answersRes = await client.query(
+                'SELECT question_id, selected_answer FROM exam_answers WHERE attempt_id = $1',
+                [attemptId]
+            );
+            const studentAnswersMap = new Map(answersRes.rows.map((a: any) => [a.question_id, a.selected_answer]));
+            let totalScore = 0;
+            const questionCount = questionsRes.rows.length;
+            const marksPerQuestion = questionCount > 0 ? parseFloat(attempt.total_marks) / questionCount : 0;
+
+            for (const q of questionsRes.rows) {
+                const selected = studentAnswersMap.get(q.id);
+                let isCorrect = false;
+                let questionScore = 0.00;
+                if (q.type !== 'descriptive' && selected) {
+                    isCorrect = selected.trim().toLowerCase() === q.correct_answer.trim().toLowerCase();
+                    questionScore = isCorrect ? marksPerQuestion : -parseFloat(attempt.negative_marks);
+                }
+                totalScore += questionScore;
+                await client.query(
+                    `INSERT INTO exam_answers (attempt_id, question_id, selected_answer, is_correct, marks_obtained)
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT (attempt_id, question_id) DO UPDATE
+                     SET is_correct = EXCLUDED.is_correct, marks_obtained = EXCLUDED.marks_obtained`,
+                    [attemptId, q.id, selected || null, isCorrect, questionScore]
+                );
+            }
+
+            await client.query(
+                `UPDATE exam_attempts
+                 SET submitted_at = CURRENT_TIMESTAMP,
+                     score = $1,
+                     status = 'graded',
+                     tab_switch_count = $2,
+                     proctoring_flags = $3,
+                     submission_reason = 'terminated_tab_switch_limit'
+                 WHERE id = $4`,
+                [totalScore, newSwitchCount, JSON.stringify(newFlags), attemptId]
+            );
+
+            await client.query('COMMIT');
+
+            res.json({
+                isTerminated: true,
+                tabSwitchCount: newSwitchCount,
+                maxSwitches,
+                remainingWarnings: 0,
+                message: 'Maximum violation limit exceeded (3 strikes). Assessment terminated and auto-submitted.'
+            });
+            return;
+        }
+
+        // Just record violation warning
+        await client.query(
+            `UPDATE exam_attempts
+             SET tab_switch_count = $1,
+                 proctoring_flags = $2
+             WHERE id = $3`,
+            [newSwitchCount, JSON.stringify(newFlags), attemptId]
+        );
+
+        await client.query('COMMIT');
+
+        res.json({
+            isTerminated: false,
+            tabSwitchCount: newSwitchCount,
+            maxSwitches,
+            remainingWarnings: Math.max(0, maxSwitches - newSwitchCount),
+            message: `Security Warning #${newSwitchCount}: Navigating away from the exam tab is recorded.`
+        });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        next(error);
+    } finally {
+        client.release();
     }
 });
 
@@ -263,6 +401,9 @@ router.post('/attempts/:attemptId/submit', authenticate, requireRole(['student']
     try {
         const { attemptId } = req.params;
         const studentId = req.user!.id;
+        const { submissionReason } = z.object({
+            submissionReason: z.string().optional()
+        }).parse(req.body || {});
 
         await client.query('BEGIN');
 
@@ -340,9 +481,9 @@ router.post('/attempts/:attemptId/submit', authenticate, requireRole(['student']
         // Update Exam Attempt score
         await client.query(
             `UPDATE exam_attempts 
-             SET submitted_at = CURRENT_TIMESTAMP, score = $1, status = $2
-             WHERE id = $3`,
-            [totalScore, finalStatus, attemptId]
+             SET submitted_at = CURRENT_TIMESTAMP, score = $1, status = $2, submission_reason = COALESCE($3, submission_reason, 'manual')
+             WHERE id = $4`,
+            [totalScore, finalStatus, submissionReason || null, attemptId]
         );
 
         await client.query('COMMIT');
@@ -367,7 +508,11 @@ router.get('/attempts/:attemptId/scorecard', authenticate, async (req: Request, 
         // Retrieve attempt with exam summary
         const attemptRes = await db.query(
             `SELECT ea.id, ea.started_at, ea.submitted_at, ea.score, ea.status, ea.student_id,
+                    COALESCE(ea.tab_switch_count, 0) as tab_switch_count,
+                    COALESCE(ea.submission_reason, 'manual') as submission_reason,
+                    COALESCE(ea.proctoring_flags, '[]'::jsonb) as proctoring_flags,
                     e.title as exam_title, e.total_marks, e.negative_marks,
+                    COALESCE(e.max_tab_switches, 3) as max_tab_switches,
                     u.first_name, u.last_name
              FROM exam_attempts ea
              JOIN exams e ON ea.exam_id = e.id
