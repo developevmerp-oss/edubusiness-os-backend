@@ -379,17 +379,42 @@ router.get('/invoices', authenticate, async (req: Request, res: Response, next: 
  */
 
 /**
- * 6. Get Available Course Bundles
+ * 6. Get Available Course Bundles (with auto-seed fallback for new tenants)
  */
 router.get('/bundles', authenticate, async (req: Request, res: Response, next: NextFunction) => {
     try {
         const tenantId = req.tenant!.id;
-        const result = await db.query(
+        let result = await db.query(
             `SELECT * FROM course_bundles 
              WHERE tenant_id = $1 AND is_published = TRUE 
              ORDER BY created_at DESC`,
             [tenantId]
         );
+
+        if (result.rows.length === 0) {
+            // Auto-seed starter bundle for tenant
+            const tRes = await db.query('SELECT name FROM tenants WHERE id = $1', [tenantId]);
+            const tName = tRes.rows[0]?.name || 'Academy';
+            const cRes = await db.query('SELECT id, title FROM courses WHERE tenant_id = $1 LIMIT 3', [tenantId]);
+            const incCourses = cRes.rows.length > 0 ? cRes.rows : [
+                { id: 'foundation', title: `${tName} Core Mastery` }
+            ];
+
+            await db.query(`
+                INSERT INTO course_bundles (tenant_id, title, description, bundle_price, original_price, discount_percentage, courses_included)
+                VALUES ($1, $2, $3, 4999.00, 7999.00, 38, $4)
+            `, [
+                tenantId, 
+                `${tName} All-Access Ranker Super Pack 2026`, 
+                'Complete access to all courses, curated question banks, and mock test papers at an exclusive combo discount.', 
+                JSON.stringify(incCourses)
+            ]);
+
+            result = await db.query(
+                `SELECT * FROM course_bundles WHERE tenant_id = $1 AND is_published = TRUE ORDER BY created_at DESC`,
+                [tenantId]
+            );
+        }
 
         res.json({ bundles: result.rows });
     } catch (error) {
@@ -398,7 +423,39 @@ router.get('/bundles', authenticate, async (req: Request, res: Response, next: N
 });
 
 /**
- * 7. Purchase Course Bundle (1-Click Super Pack Enrollment)
+ * 7. Create Course Bundle (Admin/Teacher only)
+ */
+router.post('/bundles', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const tenantId = req.tenant!.id;
+        const { title, description, bundlePrice, originalPrice, coursesIncluded } = z.object({
+            title: z.string().min(2),
+            description: z.string().optional(),
+            bundlePrice: z.number().min(0),
+            originalPrice: z.number().min(0),
+            coursesIncluded: z.array(z.object({ id: z.string(), title: z.string() })).min(1)
+        }).parse(req.body);
+
+        const discountPct = originalPrice > 0 ? Math.round(((originalPrice - bundlePrice) / originalPrice) * 100) : 0;
+
+        const result = await db.query(
+            `INSERT INTO course_bundles (tenant_id, title, description, bundle_price, original_price, discount_percentage, courses_included)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING *`,
+            [tenantId, title, description || '', bundlePrice, originalPrice, discountPct, JSON.stringify(coursesIncluded)]
+        );
+
+        res.status(201).json({
+            message: 'Course bundle published successfully!',
+            bundle: result.rows[0]
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 8. Purchase Course Bundle (1-Click Super Pack Enrollment)
  */
 router.post('/bundles/:id/buy', authenticate, async (req: Request, res: Response, next: NextFunction) => {
     const client = await db.getClient();
@@ -426,7 +483,7 @@ router.post('/bundles/:id/buy', authenticate, async (req: Request, res: Response
 
         // Enroll in all courses included
         for (const item of courses) {
-            if (item.id) {
+            if (item.id && item.id.length === 36) {
                 await client.query(
                     `INSERT INTO course_enrollments (course_id, student_id)
                      VALUES ($1, $2)
@@ -455,7 +512,7 @@ router.post('/bundles/:id/buy', authenticate, async (req: Request, res: Response
         await client.query('COMMIT');
 
         res.json({
-            message: `Super Pack Unlocked! You have been successfully enrolled in all ${courses.length} courses included in the bundle.`,
+            message: `Super Pack Unlocked! You have been successfully enrolled in all courses included in the bundle.`,
             bundleTitle: bundle.title,
             coursesEnrolled: courses.length,
             invoiceNumber
@@ -469,14 +526,14 @@ router.post('/bundles/:id/buy', authenticate, async (req: Request, res: Response
 });
 
 /**
- * 8. Get Digital Products (Notes, Formula Sheets, Test Series)
+ * 9. Get Digital Products (with auto-seed fallback for new tenants)
  */
 router.get('/digital-products', authenticate, async (req: Request, res: Response, next: NextFunction) => {
     try {
         const tenantId = req.tenant!.id;
         const userId = req.user!.id;
 
-        const result = await db.query(
+        let result = await db.query(
             `SELECT dp.*,
                     CASE WHEN dpp.id IS NOT NULL THEN TRUE ELSE FALSE END as is_purchased
              FROM digital_products dp
@@ -486,6 +543,27 @@ router.get('/digital-products', authenticate, async (req: Request, res: Response
             [userId, tenantId]
         );
 
+        if (result.rows.length === 0) {
+            // Auto-seed starter digital products
+            await db.query(`
+                INSERT INTO digital_products (tenant_id, title, description, category, price, file_url, downloads_count)
+                VALUES 
+                ($1, 'VIP Handwritten Formula & Mind-Map Booklet', 'Complete 150-page high-yield formula notes, cheat-sheets, and quick revision mind maps with DRM watermark protection.', 'Formula Notes', 199.00, 'https://scaloy.com/samples/handwritten-physics-formula-booklet.pdf', 380),
+                ($1, '500 Must-Solve High-Yield Exam Problems', 'Curated question bank with step-by-step verified solutions strictly following the examination pattern.', 'Question Bank', 349.00, 'https://scaloy.com/samples/500-must-solve-physics-nta.pdf', 245),
+                ($1, '10 Full-Length All-India Mock Test Series with Solutions', 'Simulated full-syllabus mock papers strictly according to the latest NTA examination pattern.', 'Test Series PDF', 499.00, 'https://scaloy.com/samples/10-full-mock-tests-jee.pdf', 160)
+            `, [tenantId]);
+
+            result = await db.query(
+                `SELECT dp.*,
+                        CASE WHEN dpp.id IS NOT NULL THEN TRUE ELSE FALSE END as is_purchased
+                 FROM digital_products dp
+                 LEFT JOIN digital_product_purchases dpp ON dp.id = dpp.product_id AND dpp.user_id = $1
+                 WHERE dp.tenant_id = $2 AND dp.is_published = TRUE
+                 ORDER BY dp.downloads_count DESC, dp.created_at DESC`,
+                [userId, tenantId]
+            );
+        }
+
         res.json({ products: result.rows });
     } catch (error) {
         next(error);
@@ -493,7 +571,37 @@ router.get('/digital-products', authenticate, async (req: Request, res: Response
 });
 
 /**
- * 9. Purchase Digital Product (1-Click Instant Unlock)
+ * 10. Create Digital Product (Admin/Teacher only)
+ */
+router.post('/digital-products', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const tenantId = req.tenant!.id;
+        const { title, description, category, price, fileUrl } = z.object({
+            title: z.string().min(2),
+            description: z.string().optional(),
+            category: z.string().default('Formula Notes'),
+            price: z.number().min(0),
+            fileUrl: z.string().min(4)
+        }).parse(req.body);
+
+        const result = await db.query(
+            `INSERT INTO digital_products (tenant_id, title, description, category, price, file_url)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING *`,
+            [tenantId, title, description || '', category, price, fileUrl]
+        );
+
+        res.status(201).json({
+            message: 'Digital product published to store catalog!',
+            product: result.rows[0]
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 11. Purchase Digital Product (1-Click Instant Unlock)
  */
 router.post('/digital-products/:id/buy', authenticate, async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -538,5 +646,6 @@ router.post('/digital-products/:id/buy', authenticate, async (req: Request, res:
 });
 
 export default router;
+
 
 
