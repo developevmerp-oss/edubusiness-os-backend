@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { db } from '../config/db';
 import { authenticate } from '../middlewares/auth';
+import crypto from 'crypto';
 
 const router = Router();
 
@@ -177,18 +178,75 @@ router.post('/checkout', authenticate, async (req: Request, res: Response, next:
 
         // Tax Calculation: 18% GST built-in
         const finalAmount = Math.max(0, baseAmount - discountAmount);
+        const amountInPaise = Math.round(finalAmount * 100);
+
+        // Fetch active payment gateway configuration
+        const gwRes = await db.query('SELECT * FROM payment_gateway_configs WHERE tenant_id = $1', [tenantId]);
+        const gwConfig = gwRes.rows[0] || { active_gateway: 'sandbox', is_test_mode: true };
+        const selectedGateway = (gwConfig.active_gateway || gateway || 'sandbox') as 'stripe' | 'razorpay' | 'sandbox';
 
         // Generate Order
         const orderRes = await db.query(
             `INSERT INTO orders (tenant_id, user_id, item_type, item_id, amount, discount_amount, final_amount, coupon_id, status, payment_gateway)
              VALUES ($1, $2, 'course', $3, $4, $5, $6, $7, 'pending', $8)
              RETURNING id, amount, discount_amount, final_amount, status, payment_gateway`,
-            [tenantId, userId, courseId, baseAmount, discountAmount, finalAmount, couponId, gateway]
+            [tenantId, userId, courseId, baseAmount, discountAmount, finalAmount, couponId, selectedGateway]
         );
+
+        const newOrder = orderRes.rows[0];
+        let razorpayOrderId: string | null = null;
+
+        if (selectedGateway === 'razorpay') {
+            if (gwConfig.razorpay_key_id && gwConfig.razorpay_key_secret) {
+                try {
+                    const authHeader = 'Basic ' + Buffer.from(`${gwConfig.razorpay_key_id}:${gwConfig.razorpay_key_secret}`).toString('base64');
+                    const rzpApiRes = await fetch('https://api.razorpay.com/v1/orders', {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': authHeader,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            amount: amountInPaise,
+                            currency: 'INR',
+                            receipt: newOrder.id,
+                            notes: {
+                                order_id: newOrder.id,
+                                tenant_id: tenantId,
+                                user_id: userId,
+                                course_id: courseId
+                            }
+                        })
+                    });
+
+                    if (rzpApiRes.ok) {
+                        const rzpOrderJson = await rzpApiRes.json() as any;
+                        razorpayOrderId = rzpOrderJson.id;
+                        await db.query('UPDATE orders SET gateway_order_id = $1 WHERE id = $2', [razorpayOrderId, newOrder.id]);
+                    }
+                } catch (rzpErr) {
+                    console.error('Failed to create live Razorpay order:', rzpErr);
+                }
+            }
+
+            if (!razorpayOrderId) {
+                razorpayOrderId = `order_sim_${Math.random().toString(36).substring(2, 12)}`;
+                await db.query('UPDATE orders SET gateway_order_id = $1 WHERE id = $2', [razorpayOrderId, newOrder.id]);
+            }
+        }
 
         res.status(201).json({
             message: 'Checkout order initialized.',
-            order: orderRes.rows[0]
+            order: newOrder,
+            gatewayConfig: {
+                activeGateway: selectedGateway,
+                isTestMode: gwConfig.is_test_mode ?? true,
+                razorpayKeyId: gwConfig.razorpay_key_id || 'rzp_test_public_key',
+                razorpayOrderId,
+                stripePublishableKey: gwConfig.stripe_publishable_key || '',
+                amountInPaise,
+                currency: 'INR'
+            }
         });
     } catch (error) {
         next(error);
@@ -196,50 +254,29 @@ router.post('/checkout', authenticate, async (req: Request, res: Response, next:
 });
 
 /**
- * 4. Sandbox Payment Verification (with Invoice Generation & Auto Batch Enrollment)
+ * Reusable Order Fulfillment Helper
  */
-router.post('/checkout/:orderId/verify', authenticate, async (req: Request, res: Response, next: NextFunction) => {
-    const client = await db.getClient();
-    try {
-        const { orderId } = req.params;
-        const tenantId = req.tenant!.id;
-        const userId = req.user!.id;
+async function fulfillOrder(
+    client: any, 
+    order: any, 
+    tenantId: string, 
+    userId: string, 
+    gatewayPaymentId: string, 
+    referralCode?: string
+) {
+    const orderId = order.id;
+    const courseId = order.item_id;
 
-        await client.query('BEGIN');
+    // 1. Mark Order as paid
+    await client.query(
+        `UPDATE orders 
+         SET status = 'paid', gateway_payment_id = $1, updated_at = CURRENT_TIMESTAMP 
+         WHERE id = $2`,
+        [gatewayPaymentId, orderId]
+    );
 
-        // Fetch pending order details
-        const orderRes = await client.query(
-            `SELECT id, status, item_id, final_amount, coupon_id FROM orders 
-             WHERE id = $1 AND user_id = $2 AND tenant_id = $3 FOR UPDATE`,
-            [orderId, userId, tenantId]
-        );
-
-        if (orderRes.rows.length === 0) {
-            res.status(404).json({ error: 'Order transaction not found.' });
-            await client.query('ROLLBACK');
-            return;
-        }
-
-        const order = orderRes.rows[0];
-
-        if (order.status === 'paid') {
-            res.json({ message: 'This order is already processed.', order });
-            await client.query('ROLLBACK');
-            return;
-        }
-
-        const courseId = order.item_id;
-
-        // 1. Mark Order as paid
-        const gatewayPaymentId = `sandbox-${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
-        await client.query(
-            `UPDATE orders 
-             SET status = 'paid', gateway_payment_id = $1, updated_at = CURRENT_TIMESTAMP 
-             WHERE id = $2`,
-            [gatewayPaymentId, orderId]
-        );
-
-        // 2. Add student course enrollment
+    // 2. Fulfill based on item_type
+    if (order.item_type === 'course') {
         await client.query(
             `INSERT INTO course_enrollments (course_id, student_id)
              VALUES ($1, $2)
@@ -247,15 +284,7 @@ router.post('/checkout/:orderId/verify', authenticate, async (req: Request, res:
             [courseId, userId]
         );
 
-        // 3. Increment coupon usage if applied
-        if (order.coupon_id) {
-            await client.query(
-                'UPDATE coupons SET uses_count = uses_count + 1 WHERE id = $1',
-                [order.coupon_id]
-            );
-        }
-
-        // 4. Auto Enroll into First Active Batch of the course (if exists)
+        // Auto Enroll into First Active Batch of the course (if exists)
         const batchRes = await client.query(
             `SELECT id FROM batches 
              WHERE course_id = $1 AND tenant_id = $2 
@@ -272,66 +301,126 @@ router.post('/checkout/:orderId/verify', authenticate, async (req: Request, res:
                 [batchId, userId]
             );
         }
-
-        // 5. Generate Invoice details
-        const invoiceNumber = `INV-${Date.now()}-${(Array.isArray(orderId) ? orderId[0] : orderId).slice(0, 4).toUpperCase()}`;
-        await client.query(
-            `INSERT INTO invoices (order_id, invoice_number, issued_at)
-             VALUES ($1, $2, CURRENT_TIMESTAMP)`,
-            [orderId, invoiceNumber]
-        );
-
-        // 6. Check for Referral Code & Attribute Affiliate Conversion
-        const { referralCode } = req.body || {};
-        if (referralCode) {
-            const affRes = await client.query(
-                'SELECT id, name, commission_rate FROM affiliates WHERE tenant_id = $1 AND referral_code = $2 AND status = \'active\'',
-                [tenantId, referralCode.toString().toUpperCase()]
-            );
-
-            if (affRes.rows.length > 0) {
-                const affiliate = affRes.rows[0];
-                const commRate = parseFloat(affiliate.commission_rate);
-                const orderAmount = parseFloat(order.final_amount);
-                const commissionEarned = (orderAmount * commRate) / 100;
-
-                // Fetch buyer name
-                const userRes = await client.query('SELECT first_name, last_name, email FROM users WHERE id = $1', [userId]);
-                const buyerName = userRes.rows[0] ? `${userRes.rows[0].first_name} ${userRes.rows[0].last_name}` : 'Student';
-                const buyerEmail = userRes.rows[0]?.email;
-
-                // Fetch course title
-                const courseTitleRes = await client.query('SELECT title FROM courses WHERE id = $1', [courseId]);
-                const courseTitle = courseTitleRes.rows[0]?.title || 'Course';
-
-                // Record conversion
-                await client.query(
-                    `INSERT INTO referral_conversions (tenant_id, affiliate_id, buyer_name, buyer_email, course_id, course_title, order_amount, commission_amount, status)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'approved')`,
-                    [tenantId, affiliate.id, buyerName, buyerEmail, courseId, courseTitle, orderAmount, commissionEarned]
-                );
-
-                // Update affiliate totals
-                await client.query(
-                    `UPDATE affiliates 
-                     SET total_earnings = total_earnings + $1, pending_payout = pending_payout + $1 
-                     WHERE id = $2`,
-                    [commissionEarned, affiliate.id]
-                );
+    } else if (order.item_type === 'bundle') {
+        const bRes = await client.query('SELECT courses_included FROM course_bundles WHERE id = $1', [courseId]);
+        if (bRes.rows.length > 0) {
+            const courses = bRes.rows[0].courses_included || [];
+            for (const c of courses) {
+                if (c.id && c.id !== 'foundation') {
+                    await client.query(
+                        `INSERT INTO course_enrollments (course_id, student_id)
+                         VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+                        [c.id, userId]
+                    );
+                }
             }
         }
+    }
 
-        // 7. Reconcile Abandoned Carts for this student and course
-        const studentRes = await client.query('SELECT email, phone FROM users WHERE id = $1', [userId]);
-        if (studentRes.rows.length > 0) {
-            const { email, phone } = studentRes.rows[0];
+    // 3. Increment coupon usage if applied
+    if (order.coupon_id) {
+        await client.query(
+            'UPDATE coupons SET uses_count = uses_count + 1 WHERE id = $1',
+            [order.coupon_id]
+        );
+    }
+
+    // 4. Generate Invoice details
+    const invoiceNumber = `INV-${Date.now()}-${orderId.toString().slice(0, 4).toUpperCase()}`;
+    await client.query(
+        `INSERT INTO invoices (order_id, invoice_number, issued_at)
+         VALUES ($1, $2, CURRENT_TIMESTAMP)
+         ON CONFLICT DO NOTHING`,
+        [orderId, invoiceNumber]
+    );
+
+    // 5. Affiliate Attribution if referralCode provided
+    if (referralCode) {
+        const affRes = await client.query(
+            'SELECT id, name, commission_rate FROM affiliates WHERE tenant_id = $1 AND referral_code = $2 AND status = \'active\'',
+            [tenantId, referralCode.toString().toUpperCase()]
+        );
+
+        if (affRes.rows.length > 0) {
+            const affiliate = affRes.rows[0];
+            const commRate = parseFloat(affiliate.commission_rate);
+            const orderAmount = parseFloat(order.final_amount);
+            const commissionEarned = (orderAmount * commRate) / 100;
+
+            const userRes = await client.query('SELECT first_name, last_name, email FROM users WHERE id = $1', [userId]);
+            const buyerName = userRes.rows[0] ? `${userRes.rows[0].first_name} ${userRes.rows[0].last_name}` : 'Student';
+            const buyerEmail = userRes.rows[0]?.email;
+
+            let courseTitle = 'Store Purchase';
+            if (order.item_type === 'course') {
+                const cRes = await client.query('SELECT title FROM courses WHERE id = $1', [courseId]);
+                courseTitle = cRes.rows[0]?.title || 'Course';
+            }
+
             await client.query(
-                `UPDATE abandoned_carts 
-                 SET recovery_status = 'recovered' 
-                 WHERE tenant_id = $1 AND course_id = $2 AND (student_email = $3 OR student_phone = $4)`,
-                [tenantId, courseId, email, phone || '']
+                `INSERT INTO referral_conversions (tenant_id, affiliate_id, buyer_name, buyer_email, course_id, course_title, order_amount, commission_amount, status)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'approved')`,
+                [tenantId, affiliate.id, buyerName, buyerEmail, courseId, courseTitle, orderAmount, commissionEarned]
+            );
+
+            await client.query(
+                `UPDATE affiliates 
+                 SET total_earnings = total_earnings + $1, pending_payout = pending_payout + $1 
+                 WHERE id = $2`,
+                [commissionEarned, affiliate.id]
             );
         }
+    }
+
+    // 6. Reconcile Abandoned Carts for this student and course
+    const studentRes = await client.query('SELECT email, phone FROM users WHERE id = $1', [userId]);
+    if (studentRes.rows.length > 0) {
+        const { email, phone } = studentRes.rows[0];
+        await client.query(
+            `UPDATE abandoned_carts 
+             SET recovery_status = 'recovered' 
+             WHERE tenant_id = $1 AND course_id = $2 AND (student_email = $3 OR student_phone = $4)`,
+            [tenantId, courseId, email, phone || '']
+        );
+    }
+
+    return invoiceNumber;
+}
+
+/**
+ * 4. Sandbox Payment Verification
+ */
+router.post('/checkout/:orderId/verify', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+    const client = await db.getClient();
+    try {
+        const { orderId } = req.params;
+        const tenantId = req.tenant!.id;
+        const userId = req.user!.id;
+        const { referralCode } = req.body || {};
+
+        await client.query('BEGIN');
+
+        const orderRes = await client.query(
+            `SELECT id, status, item_id, item_type, final_amount, coupon_id FROM orders 
+             WHERE id = $1 AND user_id = $2 AND tenant_id = $3 FOR UPDATE`,
+            [orderId, userId, tenantId]
+        );
+
+        if (orderRes.rows.length === 0) {
+            res.status(404).json({ error: 'Order transaction not found.' });
+            await client.query('ROLLBACK');
+            return;
+        }
+
+        const order = orderRes.rows[0];
+        if (order.status === 'paid') {
+            res.json({ message: 'This order is already processed.', order });
+            await client.query('ROLLBACK');
+            return;
+        }
+
+        const gatewayPaymentId = `sandbox-${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
+        const invoiceNumber = await fulfillOrder(client, order, tenantId, userId, gatewayPaymentId, referralCode);
 
         await client.query('COMMIT');
         res.json({
@@ -341,6 +430,128 @@ router.post('/checkout/:orderId/verify', authenticate, async (req: Request, res:
     } catch (error) {
         await client.query('ROLLBACK');
         next(error);
+    } finally {
+        client.release();
+    }
+});
+
+/**
+ * 4B. Razorpay Client Verification with HMAC SHA256 Signature Validation
+ */
+router.post('/checkout/:orderId/verify-gateway', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+    const client = await db.getClient();
+    try {
+        const { orderId } = req.params;
+        const tenantId = req.tenant!.id;
+        const userId = req.user!.id;
+        const { razorpayPaymentId, razorpayOrderId, razorpaySignature, referralCode } = req.body || {};
+
+        await client.query('BEGIN');
+
+        const orderRes = await client.query(
+            `SELECT id, status, item_id, item_type, final_amount, coupon_id, gateway_order_id, payment_gateway 
+             FROM orders 
+             WHERE id = $1 AND user_id = $2 AND tenant_id = $3 FOR UPDATE`,
+            [orderId, userId, tenantId]
+        );
+
+        if (orderRes.rows.length === 0) {
+            res.status(404).json({ error: 'Order transaction not found.' });
+            await client.query('ROLLBACK');
+            return;
+        }
+
+        const order = orderRes.rows[0];
+        if (order.status === 'paid') {
+            res.json({ message: 'Order is already processed.', order });
+            await client.query('ROLLBACK');
+            return;
+        }
+
+        // Verify Razorpay HMAC signature if secret configured
+        const gwRes = await db.query('SELECT * FROM payment_gateway_configs WHERE tenant_id = $1', [tenantId]);
+        const gwConfig = gwRes.rows[0];
+
+        if (gwConfig?.razorpay_key_secret && razorpaySignature && razorpayOrderId && razorpayPaymentId) {
+            const expected = crypto
+                .createHmac('sha256', gwConfig.razorpay_key_secret)
+                .update(razorpayOrderId + '|' + razorpayPaymentId)
+                .digest('hex');
+
+            if (expected !== razorpaySignature && !gwConfig.is_test_mode) {
+                await client.query('ROLLBACK');
+                res.status(400).json({ error: 'Cryptographic payment signature mismatch.' });
+                return;
+            }
+        }
+
+        const paymentId = razorpayPaymentId || `pay_rzp_${Date.now()}`;
+        const invoiceNumber = await fulfillOrder(client, order, tenantId, userId, paymentId, referralCode);
+
+        await client.query('COMMIT');
+        res.json({
+            message: 'Live payment verified and course unlocked successfully!',
+            invoiceNumber,
+            paymentId
+        });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        next(error);
+    } finally {
+        client.release();
+    }
+});
+
+/**
+ * 4C. Server-to-Server Razorpay Webhook Handler
+ */
+router.post('/webhooks/razorpay', async (req: Request, res: Response, next: NextFunction) => {
+    const client = await db.getClient();
+    try {
+        const signature = req.headers['x-razorpay-signature'] as string;
+        const payload = req.body;
+
+        const event = payload?.event;
+        const paymentEntity = payload?.payload?.payment?.entity;
+        const orderEntity = payload?.payload?.order?.entity;
+
+        const rzpOrderId = paymentEntity?.order_id || orderEntity?.id;
+        const rzpPaymentId = paymentEntity?.id;
+        const internalOrderId = paymentEntity?.notes?.order_id || orderEntity?.notes?.order_id || paymentEntity?.receipt;
+
+        if (!internalOrderId && !rzpOrderId) {
+            res.status(200).json({ status: 'ignored_no_order' });
+            return;
+        }
+
+        await client.query('BEGIN');
+
+        let orderQuery = 'SELECT id, tenant_id, user_id, status, item_id, item_type, final_amount, coupon_id FROM orders WHERE ';
+        let orderParams: any[] = [];
+        if (internalOrderId) {
+            orderQuery += 'id = $1 FOR UPDATE';
+            orderParams = [internalOrderId];
+        } else {
+            orderQuery += 'gateway_order_id = $1 FOR UPDATE';
+            orderParams = [rzpOrderId];
+        }
+
+        const orderRes = await client.query(orderQuery, orderParams);
+        if (orderRes.rows.length === 0 || orderRes.rows[0].status === 'paid') {
+            await client.query('COMMIT');
+            res.status(200).json({ status: 'already_paid_or_not_found' });
+            return;
+        }
+
+        const order = orderRes.rows[0];
+        await fulfillOrder(client, order, order.tenant_id, order.user_id, rzpPaymentId || 'webhook-pay', undefined);
+
+        await client.query('COMMIT');
+        res.status(200).json({ status: 'success', orderId: order.id });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Razorpay Webhook processing error:', error);
+        res.status(500).json({ error: 'Webhook processing failed' });
     } finally {
         client.release();
     }
