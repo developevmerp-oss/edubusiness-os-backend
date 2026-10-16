@@ -392,6 +392,56 @@ router.get('/abandoned-carts', authenticate, requireRole(['admin', 'teacher']), 
 });
 
 /**
+ * Helper: Dispatch Meta WhatsApp Cloud API Message
+ */
+async function dispatchMetaWhatsAppMessage(
+    config: { phoneNumberId?: string; accessToken?: string },
+    toPhone: string,
+    messageText: string
+): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    if (!config.phoneNumberId || !config.accessToken) {
+        return { success: false, error: 'Meta WhatsApp credentials missing.' };
+    }
+
+    let cleanPhone = toPhone.replace(/[^0-9]/g, '');
+    if (cleanPhone.length === 10) {
+        cleanPhone = '91' + cleanPhone; // default India prefix if 10 digits
+    }
+
+    try {
+        const metaUrl = `https://graph.facebook.com/v18.0/${config.phoneNumberId}/messages`;
+        const res = await fetch(metaUrl, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${config.accessToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                messaging_product: 'whatsapp',
+                recipient_type: 'individual',
+                to: cleanPhone,
+                type: 'text',
+                text: { preview_url: true, body: messageText }
+            })
+        });
+
+        if (res.ok) {
+            const data: any = await res.json();
+            const messageId = data?.messages?.[0]?.id;
+            return { success: true, messageId };
+        } else {
+            const errData: any = await res.json().catch(() => ({}));
+            return {
+                success: false,
+                error: errData?.error?.message || `Meta API HTTP ${res.status}`
+            };
+        }
+    } catch (err: any) {
+        return { success: false, error: err.message || 'Meta network request failed' };
+    }
+}
+
+/**
  * 12. Trigger Automated WhatsApp Recovery Nudge
  */
 router.post('/abandoned-carts/:id/recover', authenticate, requireRole(['admin', 'teacher']), async (req: Request, res: Response, next: NextFunction) => {
@@ -411,6 +461,40 @@ router.post('/abandoned-carts/:id/recover', authenticate, requireRole(['admin', 
 
         const cart = cartRes.rows[0];
 
+        // Fetch WhatsApp Cloud API Configuration
+        const cfgRes = await db.query('SELECT * FROM whatsapp_api_configs WHERE tenant_id = $1', [tenantId]);
+        const waConfig = cfgRes.rows[0];
+
+        const couponCode = cart.coupon_code || 'RECOVER15';
+        const messageBody = `Hi ${cart.student_name} 👋 We noticed you started enrolling in "${cart.course_title}" but didn't finish! Here is an exclusive 15% discount coupon: ${couponCode} valid for the next 2 hours. Click below to complete your seat:\nhttps://academy.edu/store/${cart.course_id}?coupon=${couponCode}`;
+
+        let dispatchResult: { success: boolean; messageId?: string; error?: string } = { success: true };
+        let msgStatus: 'sent' | 'simulated' | 'failed' = 'simulated';
+
+        if (waConfig && waConfig.is_enabled && waConfig.phone_number_id && waConfig.access_token) {
+            dispatchResult = await dispatchMetaWhatsAppMessage(
+                { phoneNumberId: waConfig.phone_number_id, accessToken: waConfig.access_token },
+                cart.student_phone,
+                messageBody
+            );
+            msgStatus = dispatchResult.success ? 'sent' : 'failed';
+        }
+
+        // Record message in audit table
+        await db.query(
+            `INSERT INTO whatsapp_messages (tenant_id, recipient_phone, recipient_name, direction, template_name, message_body, meta_message_id, status, error_message)
+             VALUES ($1, $2, $3, 'outbound', 'cart_recovery', $4, $5, $6, $7)`,
+            [
+                tenantId,
+                cart.student_phone,
+                cart.student_name,
+                messageBody,
+                dispatchResult.messageId || null,
+                msgStatus,
+                dispatchResult.error || null
+            ]
+        );
+
         // Update recovery status
         await db.query(
             `UPDATE abandoned_carts 
@@ -419,7 +503,7 @@ router.post('/abandoned-carts/:id/recover', authenticate, requireRole(['admin', 
             [id]
         );
 
-        // Record simulated delivery log
+        // Record simulated delivery log for legacy campaign stats
         await db.query(
             `INSERT INTO marketing_logs (tenant_id, campaign_id, recipient_email, channel, status)
              SELECT $1, id, $2, 'whatsapp', 'sent'
@@ -429,10 +513,18 @@ router.post('/abandoned-carts/:id/recover', authenticate, requireRole(['admin', 
             [tenantId, cart.student_email || `${cart.student_phone}@whatsapp`]
         );
 
+        const deliveryModeNotice = msgStatus === 'sent' 
+            ? 'Dispatched live via Meta WhatsApp Cloud API.' 
+            : msgStatus === 'failed' 
+            ? `Meta API Error: ${dispatchResult.error}` 
+            : 'Dispatched via Simulator Mode.';
+
         res.json({
-            message: `WhatsApp Recovery Nudge dispatched to ${cart.student_name} (${cart.student_phone}) with 15% discount coupon code "${cart.coupon_code}".`,
+            message: `WhatsApp Recovery Nudge dispatched to ${cart.student_name} (${cart.student_phone}). ${deliveryModeNotice}`,
             cartId: id,
-            status: 'nudge_sent'
+            status: 'nudge_sent',
+            deliveryStatus: msgStatus,
+            metaMessageId: dispatchResult.messageId
         });
     } catch (error) {
         next(error);
@@ -468,6 +560,272 @@ router.post('/abandoned-carts/record', async (req: Request, res: Response, next:
         });
     } catch (error) {
         next(error);
+    }
+});
+
+/**
+ * 14. Get WhatsApp Cloud API Configuration (Admin only)
+ */
+router.get('/whatsapp/config', authenticate, requireRole(['admin']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const tenantId = req.tenant!.id;
+        const result = await db.query('SELECT * FROM whatsapp_api_configs WHERE tenant_id = $1', [tenantId]);
+        const config = result.rows[0] || {
+            provider: 'simulator',
+            phone_number_id: '',
+            waba_id: '',
+            access_token: '',
+            webhook_verify_token: 'edubusiness_wa_secret_2026',
+            is_enabled: false
+        };
+
+        res.json({
+            config: {
+                provider: config.provider || 'simulator',
+                phoneNumberId: config.phone_number_id || '',
+                wabaId: config.waba_id || '',
+                accessToken: config.access_token ? `${config.access_token.slice(0, 8)}...${config.access_token.slice(-4)}` : '',
+                hasAccessToken: !!config.access_token,
+                webhookVerifyToken: config.webhook_verify_token || 'edubusiness_wa_secret_2026',
+                isEnabled: config.is_enabled ?? false
+            }
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 15. Update WhatsApp Cloud API Configuration (Admin only)
+ */
+router.post('/whatsapp/config', authenticate, requireRole(['admin']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const tenantId = req.tenant!.id;
+        const { provider, phoneNumberId, wabaId, accessToken, webhookVerifyToken, isEnabled } = req.body || {};
+
+        let updateQuery = `
+            INSERT INTO whatsapp_api_configs (tenant_id, provider, phone_number_id, waba_id, webhook_verify_token, is_enabled, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            ON CONFLICT (tenant_id) DO UPDATE SET
+                provider = EXCLUDED.provider,
+                phone_number_id = EXCLUDED.phone_number_id,
+                waba_id = EXCLUDED.waba_id,
+                webhook_verify_token = EXCLUDED.webhook_verify_token,
+                is_enabled = EXCLUDED.is_enabled,
+                updated_at = NOW()
+        `;
+        let params: any[] = [
+            tenantId, 
+            provider || 'meta_cloud_api', 
+            phoneNumberId || null, 
+            wabaId || null, 
+            webhookVerifyToken || 'edubusiness_wa_secret_2026', 
+            Boolean(isEnabled)
+        ];
+
+        if (accessToken && !accessToken.includes('...')) {
+            updateQuery = `
+                INSERT INTO whatsapp_api_configs (tenant_id, provider, phone_number_id, waba_id, access_token, webhook_verify_token, is_enabled, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                ON CONFLICT (tenant_id) DO UPDATE SET
+                    provider = EXCLUDED.provider,
+                    phone_number_id = EXCLUDED.phone_number_id,
+                    waba_id = EXCLUDED.waba_id,
+                    access_token = EXCLUDED.access_token,
+                    webhook_verify_token = EXCLUDED.webhook_verify_token,
+                    is_enabled = EXCLUDED.is_enabled,
+                    updated_at = NOW()
+            `;
+            params = [
+                tenantId, 
+                provider || 'meta_cloud_api', 
+                phoneNumberId || null, 
+                wabaId || null, 
+                accessToken,
+                webhookVerifyToken || 'edubusiness_wa_secret_2026', 
+                Boolean(isEnabled)
+            ];
+        }
+
+        await db.query(updateQuery, params);
+
+        res.json({ message: 'WhatsApp Cloud API settings saved successfully!' });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 16. Send Direct Test WhatsApp Message (Admin only)
+ */
+router.post('/whatsapp/test-message', authenticate, requireRole(['admin']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const tenantId = req.tenant!.id;
+        const { testPhone } = req.body || {};
+
+        if (!testPhone) {
+            res.status(400).json({ error: 'Recipient phone number is required.' });
+            return;
+        }
+
+        const cfgRes = await db.query('SELECT * FROM whatsapp_api_configs WHERE tenant_id = $1', [tenantId]);
+        const waConfig = cfgRes.rows[0];
+
+        const messageText = `⚡ Test Alert from EduBusiness OS: Your WhatsApp Cloud API gateway is successfully connected and transmitting messages in real time!`;
+
+        if (waConfig && waConfig.is_enabled && waConfig.phone_number_id && waConfig.access_token) {
+            const dispatchResult = await dispatchMetaWhatsAppMessage(
+                { phoneNumberId: waConfig.phone_number_id, accessToken: waConfig.access_token },
+                testPhone,
+                messageText
+            );
+
+            await db.query(
+                `INSERT INTO whatsapp_messages (tenant_id, recipient_phone, recipient_name, direction, template_name, message_body, meta_message_id, status, error_message)
+                 VALUES ($1, $2, 'Admin Test', 'outbound', 'system_test', $3, $4, $5, $6)`,
+                [
+                    tenantId, 
+                    testPhone, 
+                    messageText, 
+                    dispatchResult.messageId || null, 
+                    dispatchResult.success ? 'sent' : 'failed',
+                    dispatchResult.error || null
+                ]
+            );
+
+            if (dispatchResult.success) {
+                res.json({
+                    status: 'success',
+                    message: `Live test message transmitted to ${testPhone} via Meta WhatsApp Cloud API!`,
+                    metaMessageId: dispatchResult.messageId
+                });
+            } else {
+                res.status(400).json({
+                    status: 'error',
+                    error: `Meta API Error: ${dispatchResult.error || 'Failed to dispatch'}`
+                });
+            }
+            return;
+        }
+
+        // Simulator Mode fallback
+        await db.query(
+            `INSERT INTO whatsapp_messages (tenant_id, recipient_phone, recipient_name, direction, template_name, message_body, status)
+             VALUES ($1, $2, 'Admin Test', 'outbound', 'system_test', $3, 'simulated')`,
+            [tenantId, testPhone, messageText]
+        );
+
+        res.json({
+            status: 'success',
+            message: `Simulated test message recorded for ${testPhone}. (Toggle 'Enable Meta Cloud API' with valid credentials for real smartphone transmission).`
+        });
+    } catch (error: any) {
+        res.status(400).json({ error: error.message || 'Test dispatch failed' });
+    }
+});
+
+/**
+ * 17. Get Live WhatsApp Message Transmission Logs (Admin/Teacher)
+ */
+router.get('/whatsapp/messages', authenticate, requireRole(['admin', 'teacher']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const tenantId = req.tenant!.id;
+        const result = await db.query(
+            `SELECT id, recipient_phone, recipient_name, direction, template_name, message_body, meta_message_id, status, error_message, created_at
+             FROM whatsapp_messages
+             WHERE tenant_id = $1
+             ORDER BY created_at DESC
+             LIMIT 50`,
+            [tenantId]
+        );
+
+        res.json({ messages: result.rows });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 18. Meta WhatsApp Webhook Challenge Verification (GET)
+ */
+router.get('/whatsapp/webhook', async (req: Request, res: Response) => {
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+
+    if (mode === 'subscribe') {
+        const verifyCheck = await db.query(
+            'SELECT id FROM whatsapp_api_configs WHERE webhook_verify_token = $1',
+            [token]
+        );
+
+        if (verifyCheck.rows.length > 0 || token === 'edubusiness_wa_secret_2026') {
+            console.log('✅ Meta WhatsApp webhook verified successfully!');
+            res.status(200).send(challenge);
+            return;
+        }
+    }
+
+    res.status(403).send('Forbidden');
+});
+
+/**
+ * 19. Meta WhatsApp Webhook Receiver for Delivery Statuses & Inbound Replies (POST)
+ */
+router.post('/whatsapp/webhook', async (req: Request, res: Response) => {
+    try {
+        const body = req.body;
+        if (body.object === 'whatsapp_business_account' && Array.isArray(body.entry)) {
+            for (const entry of body.entry) {
+                for (const change of entry.changes || []) {
+                    const value = change.value;
+
+                    // Handle Message Status updates (delivered, read, failed)
+                    if (value?.statuses && Array.isArray(value.statuses)) {
+                        for (const statusObj of value.statuses) {
+                            const metaId = statusObj.id;
+                            const statusStr = statusObj.status; // 'sent' | 'delivered' | 'read' | 'failed'
+                            if (metaId && statusStr) {
+                                await db.query(
+                                    'UPDATE whatsapp_messages SET status = $1 WHERE meta_message_id = $2',
+                                    [statusStr, metaId]
+                                );
+                            }
+                        }
+                    }
+
+                    // Handle Inbound Replies from students
+                    if (value?.messages && Array.isArray(value.messages)) {
+                        for (const msg of value.messages) {
+                            const senderPhone = msg.from;
+                            const textBody = msg.text?.body || '[Media/Unsupported Content]';
+                            const metaId = msg.id;
+
+                            // Find tenant matching phone_number_id
+                            const phoneId = value.metadata?.phone_number_id;
+                            let tenantId: string | null = null;
+                            if (phoneId) {
+                                const tRes = await db.query('SELECT tenant_id FROM whatsapp_api_configs WHERE phone_number_id = $1 LIMIT 1', [phoneId]);
+                                tenantId = tRes.rows[0]?.tenant_id || null;
+                            }
+
+                            if (tenantId) {
+                                await db.query(
+                                    `INSERT INTO whatsapp_messages (tenant_id, recipient_phone, recipient_name, direction, template_name, message_body, meta_message_id, status)
+                                     VALUES ($1, $2, 'Student Reply', 'inbound', 'reply', $3, $4, 'received')`,
+                                    [tenantId, senderPhone, textBody, metaId]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        res.status(200).send('EVENT_RECEIVED');
+    } catch (webhookErr) {
+        console.error('Error handling Meta WhatsApp webhook:', webhookErr);
+        res.status(200).send('EVENT_RECEIVED');
     }
 });
 
