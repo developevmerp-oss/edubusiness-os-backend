@@ -181,4 +181,78 @@ router.delete('/courses/sections/:id', authenticate, requireRole(['admin', 'teac
     }
 });
 
+/**
+ * 6. Update Section (Admin/Teacher only)
+ */
+router.put('/courses/sections/:id', authenticate, requireRole(['admin', 'teacher']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const { id } = req.params;
+        const tenantId = req.tenant!.id;
+        const body = sectionSchema.partial().parse(req.body);
+
+        const sectionCheck = await db.query(
+            `SELECT cs.id FROM course_sections cs
+             JOIN courses c ON cs.course_id = c.id
+             WHERE cs.id = $1 AND c.tenant_id = $2`,
+            [id, tenantId]
+        );
+
+        if (sectionCheck.rows.length === 0) {
+            res.status(404).json({ error: 'Section not found.' });
+            return;
+        }
+
+        const result = await db.query(
+            `UPDATE course_sections
+             SET title = COALESCE($1, title), sort_order = COALESCE($2, sort_order)
+             WHERE id = $3
+             RETURNING id, title, sort_order`,
+            [body.title || null, body.sortOrder ?? null, id]
+        );
+
+        res.json({ message: 'Section updated successfully', section: result.rows[0] });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 7. Update Material (Admin/Teacher only)
+ */
+router.put('/courses/sections/materials/:id', authenticate, requireRole(['admin', 'teacher']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const { id } = req.params;
+        const tenantId = req.tenant!.id;
+        const body = materialSchema.partial().parse(req.body);
+
+        const materialCheck = await db.query(
+            `SELECT cm.id FROM course_materials cm
+             JOIN course_sections cs ON cm.section_id = cs.id
+             JOIN courses c ON cs.course_id = c.id
+             WHERE cm.id = $1 AND c.tenant_id = $2`,
+            [id, tenantId]
+        );
+
+        if (materialCheck.rows.length === 0) {
+            res.status(404).json({ error: 'Material not found.' });
+            return;
+        }
+
+        const result = await db.query(
+            `UPDATE course_materials
+             SET title = COALESCE($1, title),
+                 type = COALESCE($2, type),
+                 url = COALESCE($3, url),
+                 sort_order = COALESCE($4, sort_order)
+             WHERE id = $5
+             RETURNING id, title, type, url, sort_order`,
+            [body.title || null, body.type || null, body.url || null, body.sortOrder ?? null, id]
+        );
+
+        res.json({ message: 'Material updated successfully', material: result.rows[0] });
+    } catch (error) {
+        next(error);
+    }
+});
+
 export default router;

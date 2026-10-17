@@ -246,4 +246,57 @@ router.post('/installments/create', authenticate, requireRole(['admin']), async 
     }
 });
 
+/**
+ * 7. Create Fee Invoice (Admin only)
+ */
+router.post('/', authenticate, requireRole(['admin']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const tenantId = req.tenant!.id;
+        const { studentId, batchId, amountDue, dueDate } = z.object({
+            studentId: z.string().uuid(),
+            batchId: z.string().uuid().optional().nullable(),
+            amountDue: z.number().positive(),
+            dueDate: z.string()
+        }).parse(req.body);
+
+        const result = await db.query(
+            `INSERT INTO fees (tenant_id, student_id, batch_id, amount_due, amount_paid, due_date, status)
+             VALUES ($1, $2, $3, $4, 0, $5, 'pending')
+             RETURNING *`,
+            [tenantId, studentId, batchId || null, amountDue, dueDate]
+        );
+
+        res.status(201).json({
+            message: 'Fee invoice generated successfully.',
+            fee: result.rows[0]
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 8. Delete / Cancel Fee Invoice (Admin only)
+ */
+router.delete('/:id', authenticate, requireRole(['admin']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const tenantId = req.tenant!.id;
+        const { id } = req.params;
+
+        // Clean up any recorded payments for this fee invoice
+        await db.query('DELETE FROM fee_payments WHERE fee_id = $1 AND tenant_id = $2', [id, tenantId]);
+        const delRes = await db.query('DELETE FROM fees WHERE id = $1 AND tenant_id = $2 RETURNING id', [id, tenantId]);
+
+        if (delRes.rows.length === 0) {
+            res.status(404).json({ error: 'Fee invoice not found.' });
+            return;
+        }
+
+        res.json({ message: 'Fee invoice and associated payments deleted successfully.' });
+    } catch (error) {
+        next(error);
+    }
+});
+
 export default router;
+

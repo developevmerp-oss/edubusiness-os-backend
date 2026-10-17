@@ -192,4 +192,81 @@ router.patch('/submissions/:id/grade', authenticate, async (req: Request, res: R
     }
 });
 
+/**
+ * 6. Update Assignment (Teacher / Admin only)
+ */
+router.put('/:id', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const user = req.user!;
+        if (user.role === 'student' || user.role === 'parent') {
+            res.status(403).json({ error: 'Only teachers or administrators can update assignments.' });
+            return;
+        }
+
+        const { id } = req.params;
+        const tenantId = req.tenant!.id;
+        const body = createAssignmentSchema.partial().parse(req.body);
+
+        const checkRes = await db.query('SELECT id FROM assignments WHERE tenant_id = $1 AND id = $2', [tenantId, id]);
+        if (checkRes.rows.length === 0) {
+            res.status(404).json({ error: 'Assignment not found.' });
+            return;
+        }
+
+        const result = await db.query(
+            `UPDATE assignments
+             SET title = COALESCE($1, title),
+                 description = COALESCE($2, description),
+                 due_date = CASE WHEN $3::text IS NOT NULL THEN $3::timestamp with time zone ELSE due_date END,
+                 total_marks = COALESCE($4, total_marks),
+                 attachment_url = CASE WHEN $5::text IS NOT NULL THEN $5::text ELSE attachment_url END
+             WHERE tenant_id = $6 AND id = $7
+             RETURNING *`,
+            [
+                body.title || null,
+                body.description || null,
+                body.dueDate || null,
+                body.totalMarks || null,
+                body.attachmentUrl !== undefined ? body.attachmentUrl : null,
+                tenantId,
+                id
+            ]
+        );
+
+        res.json({ message: 'Assignment updated successfully.', assignment: result.rows[0] });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 7. Delete Assignment (Teacher / Admin only)
+ */
+router.delete('/:id', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const user = req.user!;
+        if (user.role === 'student' || user.role === 'parent') {
+            res.status(403).json({ error: 'Only teachers or administrators can delete assignments.' });
+            return;
+        }
+
+        const { id } = req.params;
+        const tenantId = req.tenant!.id;
+
+        const checkRes = await db.query('SELECT id FROM assignments WHERE tenant_id = $1 AND id = $2', [tenantId, id]);
+        if (checkRes.rows.length === 0) {
+            res.status(404).json({ error: 'Assignment not found.' });
+            return;
+        }
+
+        // Delete submissions first, then assignment
+        await db.query('DELETE FROM assignment_submissions WHERE assignment_id = $1', [id]);
+        await db.query('DELETE FROM assignments WHERE tenant_id = $1 AND id = $2', [tenantId, id]);
+
+        res.json({ message: 'Assignment deleted successfully.' });
+    } catch (error) {
+        next(error);
+    }
+});
+
 export default router;

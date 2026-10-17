@@ -564,4 +564,174 @@ router.get('/attempts/:attemptId/scorecard', authenticate, async (req: Request, 
     }
 });
 
+/**
+ * 10. Update Exam (Admin/Teacher only)
+ */
+router.put('/:id', authenticate, requireRole(['admin', 'teacher']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const { id } = req.params;
+        const tenantId = req.tenant!.id;
+        const body = examSchema.partial().parse(req.body);
+
+        const checkRes = await db.query('SELECT id FROM exams WHERE tenant_id = $1 AND id = $2', [tenantId, id]);
+        if (checkRes.rows.length === 0) {
+            res.status(404).json({ error: 'Exam not found.' });
+            return;
+        }
+
+        const result = await db.query(
+            `UPDATE exams
+             SET title = COALESCE($1, title),
+                 description = COALESCE($2, description),
+                 duration_minutes = COALESCE($3, duration_minutes),
+                 total_marks = COALESCE($4, total_marks),
+                 negative_marks = COALESCE($5, negative_marks),
+                 is_published = COALESCE($6, is_published)
+             WHERE tenant_id = $7 AND id = $8
+             RETURNING id, title, description, duration_minutes, total_marks, negative_marks, is_published`,
+            [
+                body.title || null,
+                body.description || null,
+                body.durationMinutes || null,
+                body.totalMarks || null,
+                body.negativeMarks !== undefined ? body.negativeMarks : null,
+                body.isPublished !== undefined ? body.isPublished : null,
+                tenantId,
+                id
+            ]
+        );
+
+        res.json({ message: 'Exam updated successfully.', exam: result.rows[0] });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 11. Toggle Exam Publish (Admin/Teacher only)
+ */
+router.patch('/:id/toggle-publish', authenticate, requireRole(['admin', 'teacher']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const { id } = req.params;
+        const tenantId = req.tenant!.id;
+
+        const checkRes = await db.query('SELECT id, is_published FROM exams WHERE tenant_id = $1 AND id = $2', [tenantId, id]);
+        if (checkRes.rows.length === 0) {
+            res.status(404).json({ error: 'Exam not found.' });
+            return;
+        }
+
+        const newStatus = !checkRes.rows[0].is_published;
+        const result = await db.query(
+            `UPDATE exams SET is_published = $1 WHERE tenant_id = $2 AND id = $3 RETURNING id, is_published`,
+            [newStatus, tenantId, id]
+        );
+
+        res.json({ message: newStatus ? 'Exam published to students.' : 'Exam unpublished and saved as draft.', exam: result.rows[0] });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 12. Delete Exam (Admin only)
+ */
+router.delete('/:id', authenticate, requireRole(['admin']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const { id } = req.params;
+        const tenantId = req.tenant!.id;
+
+        const checkRes = await db.query('SELECT id FROM exams WHERE tenant_id = $1 AND id = $2', [tenantId, id]);
+        if (checkRes.rows.length === 0) {
+            res.status(404).json({ error: 'Exam not found.' });
+            return;
+        }
+
+        // Delete exam attempts and answers, questions, then exam
+        await db.query('DELETE FROM exam_answers WHERE attempt_id IN (SELECT id FROM exam_attempts WHERE exam_id = $1)', [id]);
+        await db.query('DELETE FROM exam_attempts WHERE exam_id = $1', [id]);
+        await db.query('DELETE FROM questions WHERE exam_id = $1', [id]);
+        await db.query('DELETE FROM exams WHERE tenant_id = $1 AND id = $2', [tenantId, id]);
+
+        res.json({ message: 'Exam and all related questions and records deleted successfully.' });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 13. Update Question (Admin/Teacher only)
+ */
+router.put('/questions/:questionId', authenticate, requireRole(['admin', 'teacher']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const { questionId } = req.params;
+        const tenantId = req.tenant!.id;
+        const body = questionSchema.partial().parse(req.body);
+
+        const checkRes = await db.query(
+            `SELECT q.id FROM questions q
+             JOIN exams e ON q.exam_id = e.id
+             WHERE q.id = $1 AND e.tenant_id = $2`,
+            [questionId, tenantId]
+        );
+
+        if (checkRes.rows.length === 0) {
+            res.status(404).json({ error: 'Question not found.' });
+            return;
+        }
+
+        const result = await db.query(
+            `UPDATE questions
+             SET type = COALESCE($1, type),
+                 question_text = COALESCE($2, question_text),
+                 options = CASE WHEN $3::text IS NOT NULL THEN $3::jsonb ELSE options END,
+                 correct_answer = COALESCE($4, correct_answer),
+                 difficulty = COALESCE($5, difficulty),
+                 explanation = COALESCE($6, explanation)
+             WHERE id = $7
+             RETURNING id, type, question_text, options, difficulty`,
+            [
+                body.type || null,
+                body.questionText || null,
+                body.options ? JSON.stringify(body.options) : null,
+                body.correctAnswer || null,
+                body.difficulty || null,
+                body.explanation !== undefined ? body.explanation : null,
+                questionId
+            ]
+        );
+
+        res.json({ message: 'Question updated successfully.', question: result.rows[0] });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 14. Delete Question (Admin/Teacher only)
+ */
+router.delete('/questions/:questionId', authenticate, requireRole(['admin', 'teacher']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const { questionId } = req.params;
+        const tenantId = req.tenant!.id;
+
+        const checkRes = await db.query(
+            `SELECT q.id FROM questions q
+             JOIN exams e ON q.exam_id = e.id
+             WHERE q.id = $1 AND e.tenant_id = $2`,
+            [questionId, tenantId]
+        );
+
+        if (checkRes.rows.length === 0) {
+            res.status(404).json({ error: 'Question not found.' });
+            return;
+        }
+
+        await db.query('DELETE FROM questions WHERE id = $1', [questionId]);
+        res.json({ message: 'Question deleted successfully.' });
+    } catch (error) {
+        next(error);
+    }
+});
+
 export default router;

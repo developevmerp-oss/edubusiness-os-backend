@@ -281,4 +281,90 @@ router.get('/:id/students', authenticate, requireRole(['admin', 'teacher']), asy
     }
 });
 
+/**
+ * 7. Update Batch (Admin only)
+ */
+router.put('/:id', authenticate, requireRole(['admin']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const { id } = req.params;
+        const tenantId = req.tenant!.id;
+        const body = batchSchema.partial().parse(req.body);
+
+        // Check if batch exists under tenant
+        const checkRes = await db.query('SELECT id FROM batches WHERE tenant_id = $1 AND id = $2', [tenantId, id]);
+        if (checkRes.rows.length === 0) {
+            res.status(404).json({ error: 'Batch not found' });
+            return;
+        }
+
+        // If teacherId is updated, verify teacher
+        if (body.teacherId) {
+            const teacherRes = await db.query(
+                "SELECT id FROM users WHERE tenant_id = $1 AND id = $2 AND role = 'teacher'",
+                [tenantId, body.teacherId]
+            );
+            if (teacherRes.rows.length === 0) {
+                res.status(400).json({ error: 'Selected teacher does not exist.' });
+                return;
+            }
+        }
+
+        const result = await db.query(
+            `UPDATE batches
+             SET name = COALESCE($1, name),
+                 course_id = COALESCE($2, course_id),
+                 teacher_id = CASE WHEN $3::text IS NOT NULL THEN $3::uuid ELSE teacher_id END,
+                 schedule = CASE WHEN $4::text IS NOT NULL THEN $4::jsonb ELSE schedule END,
+                 start_date = CASE WHEN $5::text IS NOT NULL THEN $5::date ELSE start_date END,
+                 end_date = CASE WHEN $6::text IS NOT NULL THEN $6::date ELSE end_date END,
+                 capacity = CASE WHEN $7::text IS NOT NULL THEN $7::integer ELSE capacity END,
+                 fees = COALESCE($8, fees)
+             WHERE tenant_id = $9 AND id = $10
+             RETURNING id, name, schedule, start_date, end_date, capacity, fees`,
+            [
+                body.name || null,
+                body.courseId || null,
+                body.teacherId !== undefined ? body.teacherId : null,
+                body.schedule ? JSON.stringify(body.schedule) : null,
+                body.startDate !== undefined ? body.startDate : null,
+                body.endDate !== undefined ? body.endDate : null,
+                body.capacity !== undefined ? (body.capacity ? String(body.capacity) : null) : null,
+                body.fees !== undefined ? body.fees : null,
+                tenantId,
+                id
+            ]
+        );
+
+        res.json({ message: 'Batch updated successfully', batch: result.rows[0] });
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * 8. Delete Batch (Admin only)
+ */
+router.delete('/:id', authenticate, requireRole(['admin']), async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const { id } = req.params;
+        const tenantId = req.tenant!.id;
+
+        const checkRes = await db.query('SELECT id FROM batches WHERE tenant_id = $1 AND id = $2', [tenantId, id]);
+        if (checkRes.rows.length === 0) {
+            res.status(404).json({ error: 'Batch not found' });
+            return;
+        }
+
+        // Delete associated batch_students, live_classes, attendance, then batch
+        await db.query('DELETE FROM batch_students WHERE batch_id = $1', [id]);
+        await db.query('DELETE FROM live_classes WHERE batch_id = $1', [id]);
+        await db.query('DELETE FROM attendance WHERE batch_id = $1', [id]);
+        await db.query('DELETE FROM batches WHERE tenant_id = $1 AND id = $2', [tenantId, id]);
+
+        res.json({ message: 'Batch deleted successfully' });
+    } catch (error) {
+        next(error);
+    }
+});
+
 export default router;
